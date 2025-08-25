@@ -3,6 +3,10 @@ python3 -m venv venv
 source venv/bin/activate
 
 pip install --upgrade pip
-pip install ultralytics opencv-python torch numpy tqdm pillow supervision scenedetect google-cloud-vision openai python-dotenv scipy
+# pip install ultralytics opencv-python torch numpy tqdm pillow supervision scenedetect google-cloud-vision openai python-dotenv scipy
+# pip install scenedetect[opencv] openai python-dotenv scipy tqdm
+pip install scenedetect[opencv] openai python-dotenv scipy tqdm torch torchvision thefuzz[speedup] --index-url https://download.pytorch.org/whl/cpu hdbscan scikit-learn
 
-python3 analyser.py "https://res.cloudinary.com/dzqy1jljf/video/upload/v1752731095/wugkr6nhrnpfjmseaaep.mov" --api openai
+python3 analyser.py "https://res.cloudinary.com/dzqy1jljf/video/upload/v1752731095/wugkr6nhrnpfjmseaaep.mov"
+
+python3 new.py "https://res.cloudinary.com/dzqy1jljf/video/upload/v1752731095/wugkr6nhrnpfjmseaaep.mov"

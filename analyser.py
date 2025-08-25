@@ -2,28 +2,32 @@ import os
 import tempfile
 from pathlib import Path
 import cv2
-import torch
-import numpy as np
-from tqdm import tqdm
-from urllib.request import urlretrieve
-from ultralytics import YOLO
-from PIL import Image
-import supervision as sv
 import json
 import argparse
+from tqdm import tqdm
+from urllib.request import urlretrieve
 from scenedetect import VideoManager, SceneManager
 from scenedetect.detectors import ContentDetector
-from google.cloud import vision
 import base64
 from openai import OpenAI
 import re
 from dotenv import load_dotenv
 from collections import defaultdict
-from scipy.spatial.distance import euclidean
 
-# Load environment variables from a .env file if it exists.
-# This is a best practice for managing API keys.
+# Imports for Feature Extraction and Clustering
+import torch
+from torchvision import models, transforms
+from PIL import Image
+from hdbscan import HDBSCAN
+import numpy as np
+
+# New import for the hybrid solution
+from thefuzz import fuzz
+
+# Load environment variables from a .env file.
 load_dotenv()
+
+# --- HELPER FUNCTIONS ---
 
 def download_video(video_source):
     """Downloads video if URL, or returns path if local."""
@@ -39,7 +43,6 @@ def download_video(video_source):
 def extract_keyframes_pyscenedetect(video_path, output_folder="keyframes_pyscenedetect"):
     """
     Uses PySceneDetect to find scene cuts and extracts the middle frame of each scene.
-    Returns the output folder path and the number of saved frames.
     """
     Path(output_folder).mkdir(parents=True, exist_ok=True)
     video_manager = VideoManager([video_path])
@@ -111,101 +114,9 @@ def extract_keyframes_by_interval(video_path, output_folder="keyframes_interval"
     print(f"[INFO] ✅ Saved {saved} frames to {output_folder}")
     return output_folder, saved
 
-def analyze_keyframes_with_yolo(input_folder, yolo_model_name="yolov8l.pt", confidence_threshold=0.7, nms_iou_threshold=0.5):
+def analyze_keyframes_with_openai_vision(input_folder):
     """
-    Analyzes keyframes with YOLO for object detection. Applies NMS and confidence filtering.
-    """
-    device = "cuda" if torch.cuda.is_available() else "cpu"
-    yolo_model = YOLO(yolo_model_name)
-    image_paths = sorted(Path(input_folder).glob("*.jpg"))
-    results = []
-    pbar = tqdm(image_paths, desc="[Stage 2] Analyzing frames with YOLO")
-
-    for img_path in pbar:
-        yolo_results = yolo_model(str(img_path), verbose=False)[0]
-        detections = sv.Detections.from_ultralytics(yolo_results)
-        detections = detections[detections.confidence > confidence_threshold]
-        
-        if len(detections) > 0:
-            detections = detections.with_nms(threshold=nms_iou_threshold)
-        
-        filtered_detections = []
-        if len(detections) > 0:
-            for i in range(len(detections.xyxy)):
-                x1, y1, x2, y2 = detections.xyxy[i].astype(int)
-                label = yolo_results.names[detections.class_id[i]]
-                confidence = detections.confidence[i]
-                
-                filtered_detections.append({
-                    "label": label,
-                    "bounding_box": [int(x1), int(y1), int(x2), int(y2)],
-                    "confidence": float(confidence),
-                    "count": 1 # Added count for consistency
-                })
-
-        frame_data = {
-            "image_path": str(img_path),
-            "detections": filtered_detections,
-        }
-        results.append(frame_data)
-
-    print(f"[INFO] ✅ YOLO analysis complete for {len(results)} frames.")
-    return results
-
-def analyze_keyframes_with_google_cloud(input_folder, confidence_threshold=0.7):
-    """
-    Analyzes keyframes with Google Cloud Vision API for object localization.
-    Requires GOOGLE_APPLICATION_CREDENTIALS env var to be set.
-    """
-    client = vision.ImageAnnotatorClient()
-    image_paths = sorted(Path(input_folder).glob("*.jpg"))
-    results = []
-    pbar = tqdm(image_paths, desc="[Stage 2] Analyzing frames with Google Cloud Vision")
-
-    for img_path in pbar:
-        with open(img_path, "rb") as image_file:
-            content = image_file.read()
-        image = vision.Image(content=content)
-        
-        response = client.annotate_image({
-            'image': image,
-            'features': [{'type_': vision.Feature.Type.OBJECT_LOCALIZATION}],
-        })
-        
-        detections = []
-        img = cv2.imread(str(img_path))
-        height, width, _ = img.shape
-
-        for obj in response.localized_object_annotations:
-            if obj.score > confidence_threshold:
-                normalized_vertices = obj.bounding_poly.normalized_vertices
-                
-                x1 = int(normalized_vertices[0].x * width)
-                y1 = int(normalized_vertices[0].y * height)
-                x2 = int(normalized_vertices[2].x * width)
-                y2 = int(normalized_vertices[2].y * height)
-
-                detections.append({
-                    "label": obj.name,
-                    "bounding_box": [x1, y1, x2, y2],
-                    "confidence": float(obj.score),
-                    "count": 1 # Added count for consistency
-                })
-            
-        frame_data = {
-            "image_path": str(img_path),
-            "detections": detections,
-        }
-        results.append(frame_data)
-
-    print(f"[INFO] ✅ Google Cloud Vision analysis complete for {len(results)} frames.")
-    return results
-
-def analyze_keyframes_with_openai(input_folder):
-    """
-    Analyzes keyframes using OpenAI's GPT-4o model for object detection and bounding box extraction.
-    Note: OpenAI's vision models are not designed for precise object localization like traditional models. 
-    We use a prompt to "trick" it into returning bounding boxes, which may not be as accurate as dedicated models.
+    Analyzes keyframes using OpenAI's GPT-4o model.
     """
     client = OpenAI()
     image_paths = sorted(Path(input_folder).glob("*.jpg"))
@@ -218,12 +129,16 @@ def analyze_keyframes_with_openai(input_folder):
 
         prompt_text = """
         You are an expert image analyst. Your task is to identify all distinct objects in the image.
-        For each object, provide a label and its bounding box coordinates in a list format [x1, y1, x2, y2].
-        The coordinates should be in absolute pixel values, where x1, y1 are the top-left and x2, y2 are the bottom-right corners.
-        Return the response as a JSON array of objects, with each object having a 'label' and 'bounding_box' key.
+        For each object, provide a detailed label (including brand names if visible), its bounding box coordinates [x1, y1, x2, y2], and the count of identical items.
+        The coordinates must be in absolute pixel values, where x1, y1 are the top-left and x2, y2 are the bottom-right corners.
+
+        Return the response as a JSON array of objects. Each object should have 'label', 'bounding_box', and 'count' keys.
         The JSON should be the only content in your response. Do not include any other text, markdown formatting, or explanation.
         Example format:
-        [{"label": "dog", "bounding_box": [100, 200, 300, 400]}, {"label": "cat", "bounding_box": [500, 600, 700, 800]}]
+        [
+          {"label": "red Solo cup", "bounding_box": [100, 200, 300, 400], "count": 1},
+          {"label": "Stack of Coca-Cola cans", "bounding_box": [500, 600, 700, 800], "count": 5}
+        ]
         """
 
         try:
@@ -246,243 +161,35 @@ def analyze_keyframes_with_openai(input_folder):
                 max_tokens=2048,
             )
             
-            content = response.choices[0].message.content
+            content = response.choices[0].message.content.strip()
             
-            # Pre-process the content to handle common formatting issues
-            content = content.strip()
             if content.startswith('```json'):
                 content = content[7:]
             if content.endswith('```'):
                 content = content[:-3]
             
-            # Use a regular expression to find the JSON array in the response
-            json_match = re.search(r'\[.*\]', content, re.DOTALL)
-            
             detections = []
-            if json_match:
-                json_string = json_match.group(0)
-                try:
-                    detections = json.loads(json_string)
-                except json.JSONDecodeError as e:
-                    print(f"[WARNING] Could not parse the extracted JSON for {img_path}: {e}")
-            else:
-                print(f"[WARNING] No valid JSON array found in OpenAI response for {img_path}. Raw response: '{content[:100]}...'")
+            try:
+                detections = json.loads(content)
+            except json.JSONDecodeError as e:
+                print(f"[WARNING] Could not parse JSON for {img_path}: {e}. Raw response: '{content[:200]}...'")
+                
+            frame_data = {
+                "image_path": str(img_path),
+                "detections": detections,
+            }
+            results.append(frame_data)
 
         except Exception as e:
             print(f"[ERROR] OpenAI API call failed for {img_path}: {e}")
-            detections = []
-        
-        # We need to add a dummy confidence and count to match the output format.
-        if isinstance(detections, list):
-            for det in detections:
-                det["confidence"] = 1.0
-                det["count"] = 1 # Added count for consistency
-        else:
-            detections = []
-
-        frame_data = {
-            "image_path": str(img_path),
-            "detections": detections,
-        }
-        results.append(frame_data)
+            frame_data = {
+                "image_path": str(img_path),
+                "detections": [],
+            }
+            results.append(frame_data)
 
     print(f"[INFO] ✅ OpenAI Vision analysis complete for {len(results)} frames.")
     return results
-
-
-def get_openai_detailed_label(client, cropped_image):
-    """
-    Helper function to get a detailed label for a cropped image using OpenAI Vision.
-    It returns a dictionary with 'label' and 'count' keys.
-    """
-    try:
-        # Save the cropped image to a buffer and encode it
-        img_buffer = tempfile.NamedTemporaryFile(suffix=".jpg", delete=False)
-        cropped_image.save(img_buffer.name, format="JPEG")
-        with open(img_buffer.name, "rb") as image_file:
-            base64_image = base64.b64encode(image_file.read()).decode("utf-8")
-        os.remove(img_buffer.name)
-
-        # The new prompt asks for more detail and a count
-        prompt_text = """
-        You are an expert image analyst. Your task is to identify the object in this image.
-        Provide a concise, detailed label for the object. If the object has a brand name,
-        include it. If there are multiple identical items, provide the count.
-
-        Return the response as a JSON object with 'label' and 'count' keys.
-        'label' should be a short descriptive phrase.
-        'count' should be an integer, default to 1 if not specified.
-        The JSON should be the only content in your response. Do not include any other text or markdown.
-        Example format: {"label": "Stack of Coca-Cola cans", "count": 5}
-        """
-        response = client.chat.completions.create(
-            model="gpt-4o",
-            messages=[
-                {
-                    "role": "user",
-                    "content": [
-                        {"type": "text", "text": prompt_text},
-                        {
-                            "type": "image_url",
-                            "image_url": {
-                                "url": f"data:image/jpeg;base64,{base64_image}",
-                            },
-                        },
-                    ],
-                }
-            ],
-            max_tokens=100,
-        )
-        
-        content = response.choices[0].message.content.strip()
-        # Clean up and parse the JSON
-        if content.startswith('```json'):
-            content = content[7:]
-        if content.endswith('```'):
-            content = content[:-3]
-        
-        try:
-            result = json.loads(content)
-            label = result.get('label', 'unknown')
-            count = result.get('count', 1)
-            return label, count
-        except json.JSONDecodeError as e:
-            print(f"[WARNING] Could not parse detailed JSON from OpenAI: {e}. Raw: '{content}'")
-            return "unknown", 1
-            
-    except Exception as e:
-        print(f"[WARNING] OpenAI relabeling failed for a cropped image: {e}")
-        return "unknown", 1
-
-
-def analyze_keyframes_with_hybrid_yolo_openai(input_folder, yolo_model_name="yolov8l.pt"):
-    """
-    Performs a hybrid analysis:
-    1. Runs YOLO with a low confidence threshold to get bounding boxes for all potential objects.
-    2. Crops each detected object from the original image.
-    3. Sends each cropped image to OpenAI Vision API for accurate relabeling.
-    4. Combines the precise YOLO bounding box with the accurate OpenAI label.
-    """
-    yolo_model = YOLO(yolo_model_name)
-    openai_client = OpenAI()
-    image_paths = sorted(Path(input_folder).glob("*.jpg"))
-    hybrid_results = []
-    
-    pbar = tqdm(image_paths, desc="[Stage 2] Hybrid YOLO-OpenAI Analysis")
-
-    for img_path in pbar:
-        # Stage 1: Run YOLO with a very low confidence to catch everything
-        # We also raise NMS to avoid filtering overlapping, but different, objects
-        yolo_results = yolo_model(str(img_path), verbose=False, conf=0.1, iou=0.8)[0]
-        detections = sv.Detections.from_ultralytics(yolo_results)
-        
-        final_detections = []
-        original_image = Image.open(img_path)
-        
-        # Stage 2: Iterate through YOLO detections and relabel with OpenAI
-        for i in range(len(detections)):
-            box = detections.xyxy[i].astype(int)
-            x1, y1, x2, y2 = box
-            
-            # Crop the image using the YOLO bounding box
-            cropped_image = original_image.crop((x1, y1, x2, y2))
-            
-            # Stage 3: Send cropped image to OpenAI for relabeling with count
-            openai_label, openai_count = get_openai_detailed_label(openai_client, cropped_image)
-            
-            # Stage 4: Add to final results
-            final_detections.append({
-                "label": openai_label,
-                "count": openai_count,
-                "bounding_box": [int(x1), int(y1), int(x2), int(y2)],
-                "confidence": float(detections.confidence[i]), # We keep YOLO's confidence score
-            })
-
-        hybrid_results.append({
-            "image_path": str(img_path),
-            "detections": final_detections,
-        })
-        
-    print(f"[INFO] ✅ Hybrid YOLO-OpenAI analysis complete for {len(hybrid_results)} frames.")
-    return hybrid_results
-
-def track_objects_across_frames(detections_per_frame, max_distance=100):
-    """
-    Tracks objects across multiple frames using a simple centroid tracker.
-    Assigns unique IDs to persistent objects.
-    """
-    tracked_objects = {}  # Stores last seen position and ID for each tracked object
-    next_object_id = 0
-    final_tracked_detections = defaultdict(list)
-
-    for frame_data in detections_per_frame:
-        current_centroids = []
-        for det in frame_data['detections']:
-            x1, y1, x2, y2 = det['bounding_box']
-            centroid = (int((x1 + x2) / 2), int((y1 + y2) / 2))
-            current_centroids.append({'label': det['label'], 'count': det['count'], 'centroid': centroid})
-
-        current_frame_ids = {}
-
-        # Try to match current detections with tracked objects from previous frame
-        for i, current_det in enumerate(current_centroids):
-            matched_id = -1
-            min_dist = float('inf')
-
-            for obj_id, obj_data in tracked_objects.items():
-                distance = euclidean(current_det['centroid'], obj_data['centroid'])
-                if distance < min_dist and distance < max_distance:
-                    min_dist = distance
-                    matched_id = obj_id
-            
-            if matched_id != -1:
-                # Match found, update the tracked object
-                current_frame_ids[i] = matched_id
-                tracked_objects[matched_id] = current_det
-            else:
-                # No match found, this is a new object
-                current_frame_ids[i] = next_object_id
-                tracked_objects[next_object_id] = current_det
-                next_object_id += 1
-
-        # Add the object_id to the detections
-        for i, det in enumerate(frame_data['detections']):
-            det['object_id'] = current_frame_ids[i]
-            final_tracked_detections[det['object_id']].append(det)
-
-    return final_tracked_detections
-
-
-def get_final_object_summary(tracked_detections):
-    """
-    Aggregates the tracked objects and generates a final list of unique items with counts.
-    """
-    final_summary = defaultdict(lambda: {'count': 0, 'labels': defaultdict(int)})
-
-    for object_id, detections in tracked_detections.items():
-        # Get the most common label for this object_id
-        label_counts = defaultdict(int)
-        total_count_for_id = 0
-        for det in detections:
-            label_counts[det['label']] += 1
-            total_count_for_id = max(total_count_for_id, det['count'])
-        
-        most_common_label = max(label_counts, key=label_counts.get)
-        
-        final_summary[object_id]['count'] = total_count_for_id
-        final_summary[object_id]['label'] = most_common_label
-
-    # Format the final summary for output
-    final_list = []
-    for obj_id, data in final_summary.items():
-        final_list.append({
-            "id": obj_id,
-            "label": data['label'],
-            "count": data['count']
-        })
-
-    return final_list
-
 
 def save_results_as_json(data, output_path):
     """Saves the analysis results list to a JSON file."""
@@ -496,24 +203,26 @@ def save_visualizations(analysis_results, base_output_folder="visualizations"):
     """
     Path(base_output_folder).mkdir(parents=True, exist_ok=True)
     
-    pbar = tqdm(analysis_results, desc="[Stage 3] Saving visualizations")
-    for frame_idx, result in enumerate(pbar):
-        img_path = result['image_path']
-        detections = result['detections']
-        
+    # Group detections by image path
+    detections_by_image = defaultdict(list)
+    for result in analysis_results:
+        detections_by_image[result['image_path']].append(result)
+
+    pbar = tqdm(detections_by_image.items(), desc="[Stage 5] Saving visualizations")
+    for img_path, detections in pbar:
         if not detections:
             continue
 
         img = cv2.imread(img_path)
-        
+        if img is None:
+            continue
+
         for detection in detections:
             if not isinstance(detection.get('bounding_box'), list) or len(detection['bounding_box']) != 4:
-                print(f"[WARNING] Skipping malformed bounding box for {img_path}")
                 continue
 
             x1, y1, x2, y2 = detection['bounding_box']
             label = detection.get('label', 'unknown')
-            confidence = detection.get('confidence', 0.0)
             count = detection.get('count', 1)
             object_id = detection.get('object_id', 'N/A')
             
@@ -522,15 +231,169 @@ def save_visualizations(analysis_results, base_output_folder="visualizations"):
             cv2.rectangle(img, (x1, y1), (x2, y2), (0, 255, 0), 2)
             cv2.putText(img, display_text, (x1, y1 - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.9, (0, 255, 0), 2)
         
-        output_path_boxes = Path(base_output_folder) / f"frame_{frame_idx:04d}_boxes.jpg"
+        output_path_boxes = Path(base_output_folder) / Path(img_path).name.replace('.jpg', '_boxes.jpg')
         cv2.imwrite(str(output_path_boxes), img)
     
     print(f"[INFO] ✅ Visualizations saved to '{base_output_folder}'")
 
-def process_video_pipeline(video_source, api='yolo', keyframe_strategy='hybrid', frame_interval_seconds=1, confidence_threshold=0.7, nms_iou_threshold=0.5):
+class FeatureExtractor:
+    def __init__(self):
+        self.device = "cuda" if torch.cuda.is_available() else "cpu"
+        print(f"[INFO] Using device: {self.device} for feature extraction.")
+        
+        self.model = models.resnet50(weights=models.ResNet50_Weights.DEFAULT)
+        self.model = torch.nn.Sequential(*list(self.model.children())[:-1])
+        self.model.eval()
+        self.model.to(self.device)
+
+        self.preprocess = transforms.Compose([
+            transforms.Resize(256),
+            transforms.CenterCrop(224),
+            transforms.ToTensor(),
+            transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
+        ])
+    
+    def get_embedding(self, image_pil):
+        """Extracts a feature vector from a PIL Image."""
+        try:
+            image_tensor = self.preprocess(image_pil).unsqueeze(0).to(self.device)
+            with torch.no_grad():
+                embedding = self.model(image_tensor).squeeze()
+            return embedding.cpu().numpy()
+        except Exception as e:
+            print(f"[ERROR] Failed to extract embedding: {e}")
+            return None
+
+def extract_features_from_detections(analysis_results, keyframes_folder):
+    """
+    Iterates through all detections, crops the objects, and extracts features.
+    """
+    feature_extractor = FeatureExtractor()
+    
+    for frame_data in tqdm(analysis_results, desc="[Stage 3] Extracting features"):
+        img = cv2.imread(frame_data['image_path'])
+        if img is None:
+            print(f"[WARNING] Image not found: {frame_data['image_path']}")
+            continue
+            
+        img_rgb = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+        pil_img = Image.fromarray(img_rgb)
+        
+        for detection in frame_data['detections']:
+            x1, y1, x2, y2 = detection['bounding_box']
+            try:
+                cropped_img = pil_img.crop((x1, y1, x2, y2))
+                embedding = feature_extractor.get_embedding(cropped_img)
+                if embedding is not None:
+                    detection['embedding'] = embedding.tolist()
+                    detection['image_path'] = frame_data['image_path']
+            except Exception as e:
+                print(f"[WARNING] Could not crop or embed object: {e}")
+                detection['embedding'] = None
+    
+    return analysis_results
+
+def cluster_embeddings_hdbscan(analysis_results):
+    """
+    Clusters all object embeddings using the HDBSCAN algorithm to de-duplicate items.
+    """
+    all_detections = []
+    for frame_data in analysis_results:
+        for det in frame_data['detections']:
+            if 'embedding' in det and det['embedding'] is not None:
+                all_detections.append(det)
+
+    if not all_detections:
+        print("[INFO] No objects with embeddings found for clustering.")
+        return [], []
+    
+    embeddings = np.array([det['embedding'] for det in all_detections])
+    embeddings = embeddings / np.linalg.norm(embeddings, axis=1, keepdims=True)
+    
+    clusterer = HDBSCAN(min_cluster_size=3, cluster_selection_epsilon=0.5)
+    labels = clusterer.fit_predict(embeddings)
+    
+    for i, det in enumerate(all_detections):
+        cluster_id = labels[i]
+        det['object_id'] = f"cluster_{cluster_id}" if cluster_id != -1 else "noise"
+    
+    return analysis_results, all_detections
+
+
+def post_process_and_summarize(all_detections, fuzzy_threshold=85):
+    """
+    Performs a final, text-based aggregation to merge similar objects.
+    
+    This function processes the output of the clustering step. It groups
+    detections with similar labels (using fuzzy matching) to correct for
+    duplications missed by the visual-only clustering.
+    """
+    final_summary_dict = {}
+    
+    # First, process the clustered detections (non-noise)
+    for det in all_detections:
+        if det.get('object_id') and det['object_id'] != "noise":
+            obj_id = det['object_id']
+            if obj_id not in final_summary_dict:
+                final_summary_dict[obj_id] = {
+                    "id": obj_id,
+                    "label": det['label'],
+                    "count": det['count'],
+                    "detections": []
+                }
+            final_summary_dict[obj_id]['detections'].append(det)
+            final_summary_dict[obj_id]['count'] = max(final_summary_dict[obj_id]['count'], det['count'])
+
+    # Then, process the "noise" detections (unclustered)
+    next_unique_id = 0
+    noise_detections = [d for d in all_detections if d.get('object_id') == "noise"]
+    for det in noise_detections:
+        found_match = False
+        
+        # Check if the noise item's label is similar to an already-found unique object
+        for obj_id, obj_data in final_summary_dict.items():
+            label1 = det['label']
+            label2 = obj_data['label']
+            
+            # Use fuzzy matching to check for high similarity
+            similarity_score = fuzz.token_sort_ratio(label1, label2)
+            if similarity_score >= fuzzy_threshold:
+                # Merge this noise item into the existing group
+                obj_data['count'] = max(obj_data['count'], det['count'])
+                obj_data['detections'].append(det)
+                det['object_id'] = obj_id  # Reassign the object_id
+                found_match = True
+                break
+        
+        # If no similar group was found, create a new one
+        if not found_match:
+            new_id = f"unique_{next_unique_id}"
+            next_unique_id += 1
+            det['object_id'] = new_id
+            final_summary_dict[new_id] = {
+                "id": new_id,
+                "label": det['label'],
+                "count": det['count'],
+                "detections": [det]
+            }
+
+    # Generate the final summary list from the processed objects
+    final_summary = []
+    for obj_data in final_summary_dict.values():
+        final_summary.append({
+            "id": obj_data['id'],
+            "label": obj_data['label'],
+            "count": obj_data['count'],
+        })
+
+    return all_detections, final_summary
+
+# --- MAIN PIPELINE EXECUTION ---
+
+def process_video_pipeline(video_source, keyframe_strategy='hybrid', frame_interval_seconds=1):
     print(f"[INFO] ▶ Starting pipeline for: {video_source}")
     print(f"[INFO] ▶ Using keyframe strategy: {keyframe_strategy}")
-    print(f"[INFO] ▶ Analysis API: {api}")
+    print(f"[INFO] ▶ Analysis API: OpenAI Vision")
     
     video_path = download_video(video_source)
     
@@ -549,44 +412,22 @@ def process_video_pipeline(video_source, api='yolo', keyframe_strategy='hybrid',
             keyframes_folder, num_frames_extracted = extract_keyframes_by_interval(video_path, keyframes_folder, interval_seconds=frame_interval_seconds)
     
     if num_frames_extracted > 0:
-        print(f"\n[Stage 2] Starting analysis with {api}...")
+        print(f"\n[Stage 2] Starting analysis with OpenAI Vision...")
+        analysis_results = analyze_keyframes_with_openai_vision(keyframes_folder)
         
-        analysis_results = []
-        if api == 'yolo':
-            analysis_results = analyze_keyframes_with_yolo(
-                keyframes_folder,
-                confidence_threshold=confidence_threshold,
-                nms_iou_threshold=nms_iou_threshold
-            )
-        elif api == 'google_cloud':
-            analysis_results = analyze_keyframes_with_google_cloud(
-                keyframes_folder,
-                confidence_threshold=confidence_threshold
-            )
-        elif api == 'openai':
-            analysis_results = analyze_keyframes_with_openai(keyframes_folder)
-        elif api == 'hybrid':
-            analysis_results = analyze_keyframes_with_hybrid_yolo_openai(keyframes_folder)
-        else:
-            raise ValueError("Invalid API specified. Use 'yolo', 'google_cloud', 'openai', or 'hybrid'.")
+        print("\n[Stage 3] Extracting visual features for de-duplication...")
+        analysis_results_with_features = extract_features_from_detections(analysis_results, keyframes_folder)
         
-        # Track objects and get final summary
-        print("\n[Stage 3] Tracking objects and generating final summary...")
-        tracked_objects = track_objects_across_frames(analysis_results)
-        final_summary = get_final_object_summary(tracked_objects)
-
-        # Update the analysis_results with the object_id for visualizations
-        for frame_data in analysis_results:
-            for det in frame_data['detections']:
-                for obj_id, detections in tracked_objects.items():
-                    # Check if this detection belongs to this tracked object
-                    if any(d['label'] == det['label'] and d['bounding_box'] == det['bounding_box'] for d in detections):
-                        det['object_id'] = obj_id
-                        break
-
+        print("\n[Stage 4] Clustering embeddings to de-duplicate objects...")
+        # Get the flattened list of detections from the clustering step
+        _, all_detections_flat = cluster_embeddings_hdbscan(analysis_results_with_features)
+        
+        print("\n[Stage 5] Post-processing and summarizing results...")
+        final_results_flat, final_summary = post_process_and_summarize(all_detections_flat)
+        
         # Save all results
-        save_results_as_json(analysis_results, Path("analysis_results.json"))
-        save_visualizations(analysis_results)
+        save_results_as_json(final_results_flat, Path("analysis_results.json"))
+        save_visualizations(final_results_flat)
         save_results_as_json(final_summary, Path("final_object_summary.json"))
         
         print("\n[INFO] Final Object Summary:")
@@ -599,17 +440,11 @@ def process_video_pipeline(video_source, api='yolo', keyframe_strategy='hybrid',
     print(f"\n✅ Pipeline complete.")
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Full video -> Keyframe extraction -> Analysis pipeline.")
+    parser = argparse.ArgumentParser(description="Full video -> Keyframe extraction -> Analysis pipeline using OpenAI Vision.")
     parser.add_argument("video_source", help="URL or path to video file")
-    parser.add_argument("--api", type=str, choices=['yolo', 'google_cloud', 'openai', 'hybrid'], default='yolo',
-                        help="Choose the analysis API: 'yolo' (local), 'google_cloud' (cloud-based), 'openai' (cloud-based), or 'hybrid' (YOLO+OpenAI).")
     parser.add_argument("--keyframe_strategy", type=str, choices=['hybrid', 'scene_detect', 'interval'], default='hybrid',
                         help="Choose how to extract keyframes.")
     parser.add_argument("--frame_interval_seconds", type=float, default=1.0,
                         help="Interval in seconds for 'interval' keyframe extraction strategy.")
-    parser.add_argument("--confidence_threshold", type=float, default=0.7,
-                        help="Confidence threshold for filtering detections. Used for YOLO and Google Cloud only.")
-    parser.add_argument("--nms_iou_threshold", type=float, default=0.5,
-                        help="IoU (Intersection over Union) threshold for Non-Maximum Suppression (YOLO only).")
     args = parser.parse_args()
-    process_video_pipeline(args.video_source, args.api, args.keyframe_strategy, args.frame_interval_seconds, args.confidence_threshold, args.nms_iou_threshold)
+    process_video_pipeline(args.video_source, args.keyframe_strategy, args.frame_interval_seconds)
