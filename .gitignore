@@ -1,6 +1,7 @@
 keyframes
 venv
 visualizations
+__pycache__
 
 .env
 analysis_results.json

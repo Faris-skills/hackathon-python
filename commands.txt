@@ -10,3 +10,7 @@ pip install scenedetect[opencv] openai python-dotenv scipy tqdm torch torchvisio
 python3 analyser.py "https://res.cloudinary.com/dzqy1jljf/video/upload/v1752731095/wugkr6nhrnpfjmseaaep.mov"
 
 python3 new.py "https://res.cloudinary.com/dzqy1jljf/video/upload/v1752731095/wugkr6nhrnpfjmseaaep.mov"
+
+# SERVER VERSION
+pip install fastapi uvicorn python-dotenv pillow openai
+uvicorn server:app --reload
